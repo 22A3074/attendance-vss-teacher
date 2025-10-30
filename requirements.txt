@@ -1,3 +1,4 @@
-attendance-vss-student/
-├── app.py
-└── requirements.txt
+streamlit
+pillow
+numpy
+
