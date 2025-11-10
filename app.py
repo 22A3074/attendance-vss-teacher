@@ -1,81 +1,62 @@
+# teacher_app_fixed.py
 import streamlit as st
-from PIL import Image, ImageOps
+from PIL import Image
 import numpy as np
-import io, os, csv, hashlib
-import pandas as pd
+import io
+import hashlib
 
-st.set_page_config(page_title="👩‍🏫 教員用アプリ（安定版）", layout="wide")
+st.set_page_config(page_title="👩‍🏫 教員用アプリ（学生ごとシェア生成）", layout="centered")
+st.title("👩‍🏫 教員用アプリ（学生ごとシェア生成）")
 
-DATA_DIR = "teacher_data"
-os.makedirs(DATA_DIR, exist_ok=True)
-SHAREB_DIR = os.path.join(DATA_DIR, "shareb")
-os.makedirs(SHAREB_DIR, exist_ok=True)
-SHAREB_HASH_FILE = os.path.join(DATA_DIR, "shareb_hashes.csv")
-ATTEND_FILE = os.path.join(DATA_DIR, "attendance.csv")
+uploaded = st.file_uploader("QRコード画像をアップロード（PNG/JPG）", type=["png", "jpg", "jpeg"])
+student_text = st.text_area("学生IDリストを改行区切りで入力（例: s001）", height=200)
+student_list = [s.strip() for s in student_text.splitlines() if s.strip()]
 
-def sha256_bytes(b):
-    return hashlib.sha256(b).hexdigest()
+threshold = st.slider("閾値（画像→2値化）", min_value=1, max_value=254, value=128)
 
-def save_shareb_hashes(mapping):
-    with open(SHAREB_HASH_FILE, "w", newline="", encoding="utf-8") as f:
-        writer = csv.writer(f)
-        writer.writerow(["student_id","sha256"])
-        for sid,sha in mapping.items():
-            writer.writerow([sid,sha])
+def stable_seed_from_str(s: str) -> int:
+    # sha256 を使って安定な 32bit 整数を作る
+    h = hashlib.sha256(s.encode("utf-8")).digest()
+    # 上位4バイトを取り出して整数化
+    return int.from_bytes(h[:4], "big")
 
-def load_shareb_hashes():
-    if not os.path.exists(SHAREB_HASH_FILE):
-        return {}
-    df = pd.read_csv(SHAREB_HASH_FILE, dtype=str)
-    return dict(zip(df["student_id"], df["sha256"]))
+if uploaded and student_list:
+    try:
+        # 画像を読み込んでグレースケールにし、閾値で0/1の配列に変換
+        img = Image.open(uploaded).convert("L")
+        arr = np.array(img)  # 0-255
+        bin_base = (arr < threshold).astype(np.uint8)  # QR の「黒」を 1 にする（閾値以下を黒扱い）
+        # bin_base は 0/1（uint8）
+        st.success(f"入力画像サイズ: {img.size[0]} x {img.size[1]}、学生数: {len(student_list)}")
 
-st.title("👩‍🏫 教員用アプリ（ShareB固定 / ShareA授業ごと）")
-
-with st.expander("1) ShareBを学生ごとに生成（初回のみ）", expanded=True):
-    secret = st.text_input("Master Secret（教員専用）", type="password")
-    text = st.text_area("学生IDを改行で入力")
-    if st.button("生成"):
-        ids = [s.strip() for s in text.splitlines() if s.strip()]
-        mapping = load_shareb_hashes()
-        for sid in ids:
-            seed = int(hashlib.sha256((secret+sid).encode()).hexdigest(),16) % (2**32)
+        for student in student_list:
+            seed = stable_seed_from_str(student)
             rng = np.random.default_rng(seed=seed)
-            arr = rng.integers(0,2,(300,300),dtype=np.uint8)
-            img = Image.fromarray((1-arr)*255)
-            buf = io.BytesIO()
-            img.save(buf,format="PNG")
-            data = buf.getvalue()
-            with open(os.path.join(SHAREB_DIR,f"shareB_{sid}.png"),"wb") as f: f.write(data)
-            mapping[sid] = sha256_bytes(data)
-            st.download_button(f"{sid} 用 ShareB ダウンロード", data, file_name=f"shareB_{sid}.png")
-        save_shareb_hashes(mapping)
-        st.success("ShareB生成およびハッシュ記録が完了しました。")
+            # shareA: 0/1 のランダム配列
+            shareA = rng.integers(0, 2, size=bin_base.shape, dtype=np.uint8)
+            # shareB = base XOR shareA  (0/1 同士)
+            shareB = bin_base ^ shareA
 
-with st.expander("2) 授業用 ShareA を学生ごと生成（毎授業）", expanded=False):
-    imgfile = st.file_uploader("授業用QR画像", type=["png","jpg"])
-    class_id = st.text_input("Class ID")
-    if st.button("生成（ShareA）"):
-        if imgfile and class_id:
-            base = Image.open(imgfile).convert("L")
-            base = ImageOps.invert(base)
-            np_base = (np.array(base)//255).astype(np.uint8)
-            mapping = load_shareb_hashes()
-            for sid in mapping:
-                shareb_img_path = os.path.join(SHAREB_DIR,f"shareB_{sid}.png")
-                imgB = Image.open(shareb_img_path).convert("L").resize(base.size,Image.NEAREST)
-                np_B = 1-(np.array(imgB)//255)
-                np_A = np_base ^ np_B
-                imgA = Image.fromarray((1-np_A)*255)
-                buf = io.BytesIO()
-                imgA.save(buf,format="PNG")
-                st.download_button(f"{sid} 用 ShareA", buf.getvalue(), file_name=f"shareA_{class_id}_{sid}.png")
-        else:
-            st.error("QR画像とClass IDを入力してください。")
+            # 画像化: 0->255 (白), 1->0 (黒) に戻す（視覚復号と合わせる）
+            imgA = Image.fromarray((255 * (1 - shareA)).astype(np.uint8))  # 教員保存用（白=背景）
+            imgB = Image.fromarray((255 * (1 - shareB)).astype(np.uint8))  # 配布用
 
-with st.expander("3) 出席記録を確認", expanded=False):
-    if os.path.exists(ATTEND_FILE):
-        df = pd.read_csv(ATTEND_FILE)
-        st.dataframe(df)
-        st.download_button("CSVダウンロード", df.to_csv(index=False).encode(), "attendance.csv")
-    else:
-        st.info("まだ出席記録はありません。")
+            # バッファに入れる
+            bufA = io.BytesIO()
+            bufB = io.BytesIO()
+            imgA.save(bufA, format="PNG")
+            imgB.save(bufB, format="PNG")
+
+            col1, col2 = st.columns([1,1])
+            with col1:
+                st.image(imgA, caption=f"{student} 用 ShareA (教員保管)", width=120)
+            with col2:
+                st.image(imgB, caption=f"{student} 用 ShareB (配布用)", width=120)
+
+            st.download_button(f"📥 {student}用シェアA（教員保管）", data=bufA.getvalue(), file_name=f"shareA_{student}.png", mime="image/png")
+            st.download_button(f"📤 {student}用シェアB（配布用）", data=bufB.getvalue(), file_name=f"shareB_{student}.png", mime="image/png")
+
+    except Exception as e:
+        st.error(f"処理中にエラーが発生しました: {e}")
+else:
+    st.info("右上から QR 画像をアップロードし、学生IDリストを入力してください。")
